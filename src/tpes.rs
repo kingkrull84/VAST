@@ -1,4 +1,5 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(align(64))]
 pub struct Tpes {
     pub tier: u8,      // 4 bits (0-15)
     pub positrons: u16,// 12 bits (0-4095)
@@ -101,5 +102,10 @@ mod tests {
     fn test_net_exhaust() {
         let proton = Tpes::new(2, 2, 1, 1);
         assert_eq!(proton.net_exhaust(), 1);
+    }
+
+    #[test]
+    fn test_tpes_alignment() {
+        assert_eq!(std::mem::align_of::<Tpes>(), 64);
     }
 }

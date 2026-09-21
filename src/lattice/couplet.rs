@@ -4,6 +4,7 @@ use crate::uss::Z9;
 /// The ID 2 Couplet is the universal baseline unit cell (1 USS Unit).
 /// All spatial bounds, energy levels, and scales are measured as integer multiples of this reference unit.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(align(64))]
 pub struct Couplet {
     pub id: u64,
     pub particle_dna: Tpes,
@@ -94,5 +95,10 @@ mod tests {
         // flux = 1 + 1*2 = 3, pressure becomes 2
         assert_eq!(couplet.flux, Z9::new(3));
         assert_eq!(couplet.pressure, Z9::new(2));
+    }
+
+    #[test]
+    fn test_couplet_alignment() {
+        assert_eq!(std::mem::align_of::<Couplet>(), 64);
     }
 }

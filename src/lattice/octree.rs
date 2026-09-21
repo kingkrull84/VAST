@@ -47,31 +47,36 @@ pub struct StabilityTelemetry {
     pub aggregate_flux: u8,   // Z9 ring sum of flux
 }
 
-enum OctreeNode {
+#[derive(Debug, Clone)]
+#[repr(align(64))]
+pub enum OctreeNode {
     Leaf {
         couplets: Vec<((i64, i64, i64), Couplet)>,
     },
     Internal {
-        children: Box<[OctreeNode; 8]>,
+        children_indices: [usize; 8],
     },
 }
 
-/// Sparse Octree for adaptive spatial resolution, coarse in empty space
-/// and dynamically subdividing 2x2x2 down to the Planck scale where energy exists.
+/// Sparse Octree utilizing a contiguous 1D memory pool (arena) and strict double-buffering
+/// (`read_state` and `write_state`) for 100% deterministic, lock-free parallelizable simulation steps.
 pub struct Octree {
     bounds: AABB,
     capacity: usize,
     max_depth: usize,
-    root: OctreeNode,
+    read_state: Vec<OctreeNode>,
+    write_state: Vec<OctreeNode>,
 }
 
 impl Octree {
     pub fn new(bounds: AABB, capacity: usize, max_depth: usize) -> Self {
+        let root = OctreeNode::Leaf { couplets: Vec::new() };
         Self {
             bounds,
             capacity,
             max_depth,
-            root: OctreeNode::Leaf { couplets: Vec::new() },
+            read_state: vec![root.clone()],
+            write_state: vec![root],
         }
     }
 
@@ -79,11 +84,21 @@ impl Octree {
         if !self.bounds.contains(pos) {
             return false;
         }
-        Self::insert_node(&mut self.root, self.bounds, pos, couplet, self.capacity, self.max_depth, 0)
+        let bounds = self.bounds;
+        let cap = self.capacity;
+        let max_d = self.max_depth;
+
+        let inserted = Self::insert_into_pool(&mut self.read_state, 0, bounds, pos, couplet, cap, max_d, 0);
+        if inserted {
+            // Keep write_state synchronized with read_state topology and couplet state
+            self.write_state = self.read_state.clone();
+        }
+        inserted
     }
 
-    fn insert_node(
-        node: &mut OctreeNode,
+    fn insert_into_pool(
+        pool: &mut Vec<OctreeNode>,
+        node_idx: usize,
         bounds: AABB,
         pos: (i64, i64, i64),
         couplet: Couplet,
@@ -91,73 +106,87 @@ impl Octree {
         max_depth: usize,
         current_depth: usize,
     ) -> bool {
-        match node {
-            OctreeNode::Leaf { couplets } => {
+        let is_leaf = matches!(pool[node_idx], OctreeNode::Leaf { .. });
+
+        if is_leaf {
+            let mut subdivide = false;
+            let mut existing_couplets = Vec::new();
+
+            if let OctreeNode::Leaf { couplets } = &mut pool[node_idx] {
                 for (p, c) in couplets.iter_mut() {
                     if *p == pos {
-                        *c = couplet;
+                        *c = couplet.clone();
                         return true;
                     }
                 }
 
                 if couplets.len() < capacity || current_depth >= max_depth {
                     couplets.push((pos, couplet));
-                    true
+                    return true;
                 } else {
-                    let mut existing = std::mem::take(couplets);
-                    existing.push((pos, couplet));
-
-                    let mid_x = bounds.min_x + (bounds.max_x - bounds.min_x) / 2;
-                    let mid_y = bounds.min_y + (bounds.max_y - bounds.min_y) / 2;
-                    let mid_z = bounds.min_z + (bounds.max_z - bounds.min_z) / 2;
-
-                    let mut children = Box::new([
-                        OctreeNode::Leaf { couplets: Vec::new() },
-                        OctreeNode::Leaf { couplets: Vec::new() },
-                        OctreeNode::Leaf { couplets: Vec::new() },
-                        OctreeNode::Leaf { couplets: Vec::new() },
-                        OctreeNode::Leaf { couplets: Vec::new() },
-                        OctreeNode::Leaf { couplets: Vec::new() },
-                        OctreeNode::Leaf { couplets: Vec::new() },
-                        OctreeNode::Leaf { couplets: Vec::new() },
-                    ]);
-
-                    for (p, c) in existing {
-                        let child_idx = Self::get_child_index(p, mid_x, mid_y, mid_z);
-                        let child_bounds = Self::get_child_bounds(bounds, child_idx, mid_x, mid_y, mid_z);
-                        Self::insert_node(
-                            &mut children[child_idx],
-                            child_bounds,
-                            p,
-                            c,
-                            capacity,
-                            max_depth,
-                            current_depth + 1,
-                        );
-                    }
-
-                    *node = OctreeNode::Internal { children };
-                    true
+                    subdivide = true;
+                    existing_couplets = std::mem::take(couplets);
+                    existing_couplets.push((pos, couplet));
                 }
             }
-            OctreeNode::Internal { children } => {
+
+            if subdivide {
                 let mid_x = bounds.min_x + (bounds.max_x - bounds.min_x) / 2;
                 let mid_y = bounds.min_y + (bounds.max_y - bounds.min_y) / 2;
                 let mid_z = bounds.min_z + (bounds.max_z - bounds.min_z) / 2;
 
-                let child_idx = Self::get_child_index(pos, mid_x, mid_y, mid_z);
-                let child_bounds = Self::get_child_bounds(bounds, child_idx, mid_x, mid_y, mid_z);
-                Self::insert_node(
-                    &mut children[child_idx],
-                    child_bounds,
-                    pos,
-                    couplet,
-                    capacity,
-                    max_depth,
-                    current_depth + 1,
-                )
+                let mut children_indices = [0usize; 8];
+                for i in 0..8 {
+                    let child_node_idx = pool.len();
+                    pool.push(OctreeNode::Leaf { couplets: Vec::new() });
+                    children_indices[i] = child_node_idx;
+                }
+
+                pool[node_idx] = OctreeNode::Internal { children_indices };
+
+                for (p, c) in existing_couplets {
+                    let child_slot = Self::get_child_index(p, mid_x, mid_y, mid_z);
+                    let child_idx = children_indices[child_slot];
+                    let child_bounds = Self::get_child_bounds(bounds, child_slot, mid_x, mid_y, mid_z);
+                    Self::insert_into_pool(
+                        pool,
+                        child_idx,
+                        child_bounds,
+                        p,
+                        c,
+                        capacity,
+                        max_depth,
+                        current_depth + 1,
+                    );
+                }
+                return true;
             }
+        } else {
+            let children_indices = match &pool[node_idx] {
+                OctreeNode::Internal { children_indices } => *children_indices,
+                _ => unreachable!(),
+            };
+
+            let mid_x = bounds.min_x + (bounds.max_x - bounds.min_x) / 2;
+            let mid_y = bounds.min_y + (bounds.max_y - bounds.min_y) / 2;
+            let mid_z = bounds.min_z + (bounds.max_z - bounds.min_z) / 2;
+
+            let child_slot = Self::get_child_index(pos, mid_x, mid_y, mid_z);
+            let child_idx = children_indices[child_slot];
+            let child_bounds = Self::get_child_bounds(bounds, child_slot, mid_x, mid_y, mid_z);
+            return Self::insert_into_pool(
+                pool,
+                child_idx,
+                child_bounds,
+                pos,
+                couplet,
+                capacity,
+                max_depth,
+                current_depth + 1,
+            );
         }
+
+        false
     }
 
     fn get_child_index(pos: (i64, i64, i64), mid_x: i64, mid_y: i64, mid_z: i64) -> usize {
@@ -181,14 +210,20 @@ impl Octree {
     }
 
     pub fn query(&self, pos: (i64, i64, i64)) -> Option<&Couplet> {
-        Self::query_node(&self.root, self.bounds, pos)
+        Self::query_pool(&self.read_state, 0, self.bounds, pos)
     }
 
-    fn query_node<'a>(node: &'a OctreeNode, bounds: AABB, pos: (i64, i64, i64)) -> Option<&'a Couplet> {
-        if !bounds.contains(pos) {
+    fn query_pool<'a>(
+        pool: &'a [OctreeNode],
+        node_idx: usize,
+        bounds: AABB,
+        pos: (i64, i64, i64),
+    ) -> Option<&'a Couplet> {
+        if !bounds.contains(pos) || node_idx >= pool.len() {
             return None;
         }
-        match node {
+
+        match &pool[node_idx] {
             OctreeNode::Leaf { couplets } => {
                 for (p, c) in couplets {
                     if *p == pos {
@@ -197,56 +232,64 @@ impl Octree {
                 }
                 None
             }
-            OctreeNode::Internal { children } => {
+            OctreeNode::Internal { children_indices } => {
                 let mid_x = bounds.min_x + (bounds.max_x - bounds.min_x) / 2;
                 let mid_y = bounds.min_y + (bounds.max_y - bounds.min_y) / 2;
                 let mid_z = bounds.min_z + (bounds.max_z - bounds.min_z) / 2;
 
-                let child_idx = Self::get_child_index(pos, mid_x, mid_y, mid_z);
-                let child_bounds = Self::get_child_bounds(bounds, child_idx, mid_x, mid_y, mid_z);
-                Self::query_node(&children[child_idx], child_bounds, pos)
+                let child_slot = Self::get_child_index(pos, mid_x, mid_y, mid_z);
+                let child_idx = children_indices[child_slot];
+                let child_bounds = Self::get_child_bounds(bounds, child_slot, mid_x, mid_y, mid_z);
+                Self::query_pool(pool, child_idx, child_bounds, pos)
             }
         }
     }
 
-    /// Collects all active couplet positions and pressures into a hash map.
-    fn collect_pressures(node: &OctreeNode, map: &mut HashMap<(i64, i64, i64), Z9>) {
-        match node {
+    /// Collects all active couplet positions and pressures into a hash map from the read pool.
+    fn collect_pressures_from_pool(pool: &[OctreeNode], node_idx: usize, map: &mut HashMap<(i64, i64, i64), Z9>) {
+        if node_idx >= pool.len() {
+            return;
+        }
+        match &pool[node_idx] {
             OctreeNode::Leaf { couplets } => {
                 for (pos, couplet) in couplets {
                     map.insert(*pos, couplet.pressure);
                 }
             }
-            OctreeNode::Internal { children } => {
-                for child in children.iter() {
-                    Self::collect_pressures(child, map);
+            OctreeNode::Internal { children_indices } => {
+                for &child_idx in children_indices {
+                    Self::collect_pressures_from_pool(pool, child_idx, map);
                 }
             }
         }
     }
 
-    /// Steps simulation by updating flux state of all couplets inside the octree using Z/9Z arithmetic,
-    /// incorporating 6-neighbor stencil lookup for adjacent pressure transfer.
+    /// Steps simulation strictly using double-buffering.
+    /// Reads current state from `read_state`, computes 6-neighbor flux updates into `write_state`,
+    /// and performs `std::mem::swap(&mut self.read_state, &mut self.write_state)` at the end of the tick.
     pub fn step(&mut self) {
         let mut pressure_map = HashMap::new();
-        Self::collect_pressures(&self.root, &mut pressure_map);
-        Self::step_node(&mut self.root, &pressure_map);
-    }
+        Self::collect_pressures_from_pool(&self.read_state, 0, &mut pressure_map);
 
-    fn step_node(node: &mut OctreeNode, pressure_map: &HashMap<(i64, i64, i64), Z9>) {
-        match node {
-            OctreeNode::Leaf { couplets } => {
-                let neighbor_offsets: [(i64, i64, i64); 6] = [
-                    (1, 0, 0),
-                    (-1, 0, 0),
-                    (0, 1, 0),
-                    (0, -1, 0),
-                    (0, 0, 1),
-                    (0, 0, -1),
-                ];
+        let neighbor_offsets: [(i64, i64, i64); 6] = [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ];
 
-                for (pos, couplet) in couplets {
-                    // Accumulate pressure from 6 adjacent neighbors in Z/9Z ring
+        // Ensure write_state matches topology of read_state
+        if self.write_state.len() != self.read_state.len() {
+            self.write_state = self.read_state.clone();
+        }
+
+        for idx in 0..self.read_state.len() {
+            if let (OctreeNode::Leaf { couplets: read_couplets }, OctreeNode::Leaf { couplets: write_couplets }) =
+                (&self.read_state[idx], &mut self.write_state[idx])
+            {
+                for (i, (pos, read_couplet)) in read_couplets.iter().enumerate() {
                     let mut neighbor_pressure = Z9::ZERO;
                     for offset in &neighbor_offsets {
                         let n_pos = (pos.0 + offset.0, pos.1 + offset.1, pos.2 + offset.2);
@@ -255,18 +298,18 @@ impl Octree {
                         }
                     }
 
-                    // Update couplet flux with local energy and combined (local + neighbor) pressure
-                    let total_pressure = couplet.pressure + neighbor_pressure;
-                    couplet.flux = Z9::update_flux(couplet.energy, total_pressure);
-                    couplet.pressure += Z9::ONE;
-                }
-            }
-            OctreeNode::Internal { children } => {
-                for child in children.iter_mut() {
-                    Self::step_node(child, pressure_map);
+                    let total_pressure = read_couplet.pressure + neighbor_pressure;
+                    let next_flux = Z9::update_flux(read_couplet.energy, total_pressure);
+                    let next_pressure = read_couplet.pressure + Z9::ONE;
+
+                    write_couplets[i].1.flux = next_flux;
+                    write_couplets[i].1.pressure = next_pressure;
                 }
             }
         }
+
+        // Fast double-buffering pool swap
+        std::mem::swap(&mut self.read_state, &mut self.write_state);
     }
 
     /// Collects and computes current stability telemetry metrics.
@@ -279,8 +322,9 @@ impl Octree {
         let mut aggregate_energy = Z9::ZERO;
         let mut aggregate_flux = Z9::ZERO;
 
-        Self::collect_telemetry(
-            &self.root,
+        Self::collect_telemetry_from_pool(
+            &self.read_state,
+            0,
             0,
             &mut total_couplets,
             &mut active_nodes,
@@ -302,8 +346,9 @@ impl Octree {
         }
     }
 
-    fn collect_telemetry(
-        node: &OctreeNode,
+    fn collect_telemetry_from_pool(
+        pool: &[OctreeNode],
+        node_idx: usize,
         current_depth: usize,
         total_couplets: &mut usize,
         active_nodes: &mut usize,
@@ -313,12 +358,16 @@ impl Octree {
         aggregate_energy: &mut Z9,
         aggregate_flux: &mut Z9,
     ) {
+        if node_idx >= pool.len() {
+            return;
+        }
+
         *active_nodes += 1;
         if current_depth > *max_observed_depth {
             *max_observed_depth = current_depth;
         }
 
-        match node {
+        match &pool[node_idx] {
             OctreeNode::Leaf { couplets } => {
                 *total_couplets += couplets.len();
                 for (_, couplet) in couplets {
@@ -328,10 +377,11 @@ impl Octree {
                     *aggregate_flux += couplet.flux;
                 }
             }
-            OctreeNode::Internal { children } => {
-                for child in children.iter() {
-                    Self::collect_telemetry(
-                        child,
+            OctreeNode::Internal { children_indices } => {
+                for &child_idx in children_indices {
+                    Self::collect_telemetry_from_pool(
+                        pool,
+                        child_idx,
                         current_depth + 1,
                         total_couplets,
                         active_nodes,
@@ -353,6 +403,11 @@ mod tests {
     use crate::tpes::Tpes;
 
     #[test]
+    fn test_octree_node_alignment() {
+        assert_eq!(std::mem::align_of::<OctreeNode>(), 64);
+    }
+
+    #[test]
     fn test_octree_insertion_and_query() {
         let bounds = AABB::new(-10, 10, -10, 10, -10, 10);
         let mut octree = Octree::new(bounds, 1, 4);
@@ -369,7 +424,7 @@ mod tests {
     #[test]
     fn test_octree_subdivision() {
         let bounds = AABB::new(-10, 10, -10, 10, -10, 10);
-        let mut octree = Octree::new(bounds, 1, 4); // Capacity 1 forces subdivision on 2nd insertion
+        let mut octree = Octree::new(bounds, 1, 4);
 
         let dna1 = Tpes::new(2, 2, 1, 1);
         let dna2 = Tpes::new(1, 1, 0, 0);
@@ -409,15 +464,11 @@ mod tests {
         let mut c1 = Couplet::new_baseline(dna);
         let c2 = Couplet::new_baseline(dna);
 
-        c1.pressure = Z9::new(3); // set c1 pressure to 3
+        c1.pressure = Z9::new(3);
 
         octree.insert((0, 0, 0), c1);
-        octree.insert((1, 0, 0), c2); // adjacent along x-axis
+        octree.insert((1, 0, 0), c2);
 
-        // Before step, c2 has energy=1, pressure=0
-        // During step, c2 perceives neighbor pressure 3 from c1 at (0,0,0)
-        // total_pressure for c2 = 0 + 3 = 3
-        // flux for c2 = (1 + 3 * 2) mod 9 = 7 mod 9 = 7
         octree.step();
 
         let c2_updated = octree.query((1, 0, 0)).unwrap();
