@@ -1,5 +1,6 @@
 use crate::lattice::couplet::Couplet;
 use crate::uss::Z9;
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// 3D Spatial Bounding Box in integer coordinates.
@@ -285,31 +286,71 @@ impl Octree {
             self.write_state = self.read_state.clone();
         }
 
-        for idx in 0..self.read_state.len() {
-            if let (OctreeNode::Leaf { couplets: read_couplets }, OctreeNode::Leaf { couplets: write_couplets }) =
-                (&self.read_state[idx], &mut self.write_state[idx])
-            {
-                for (i, (pos, read_couplet)) in read_couplets.iter().enumerate() {
-                    let mut neighbor_pressure = Z9::ZERO;
-                    for offset in &neighbor_offsets {
-                        let n_pos = (pos.0 + offset.0, pos.1 + offset.1, pos.2 + offset.2);
-                        if let Some(&p) = pressure_map.get(&n_pos) {
-                            neighbor_pressure += p;
+        self.read_state
+            .par_iter()
+            .zip(self.write_state.par_iter_mut())
+            .for_each(|(read_node, write_node)| {
+                if let (
+                    OctreeNode::Leaf { couplets: read_couplets },
+                    OctreeNode::Leaf { couplets: write_couplets },
+                ) = (read_node, write_node)
+                {
+                    for (i, (pos, read_couplet)) in read_couplets.iter().enumerate() {
+                        let mut neighbor_pressure = Z9::ZERO;
+                        for offset in &neighbor_offsets {
+                            let n_pos = (pos.0 + offset.0, pos.1 + offset.1, pos.2 + offset.2);
+                            if let Some(&p) = pressure_map.get(&n_pos) {
+                                neighbor_pressure += p;
+                            }
                         }
+
+                        let total_pressure = read_couplet.pressure + neighbor_pressure;
+                        let next_flux = Z9::update_flux(read_couplet.energy, total_pressure);
+                        let next_pressure = read_couplet.pressure + Z9::ONE;
+
+                        write_couplets[i].1.flux = next_flux;
+                        write_couplets[i].1.pressure = next_pressure;
                     }
-
-                    let total_pressure = read_couplet.pressure + neighbor_pressure;
-                    let next_flux = Z9::update_flux(read_couplet.energy, total_pressure);
-                    let next_pressure = read_couplet.pressure + Z9::ONE;
-
-                    write_couplets[i].1.flux = next_flux;
-                    write_couplets[i].1.pressure = next_pressure;
                 }
-            }
-        }
+            });
 
         // Fast double-buffering pool swap
         std::mem::swap(&mut self.read_state, &mut self.write_state);
+    }
+
+    /// Collects active leaf regions (AABBs) and active couplets for 3D visual telemetry.
+    pub fn collect_active_leaves(&self) -> Vec<(AABB, Vec<((i64, i64, i64), Couplet)>)> {
+        let mut leaves = Vec::new();
+        Self::collect_leaves_from_pool(&self.read_state, 0, self.bounds, &mut leaves);
+        leaves
+    }
+
+    fn collect_leaves_from_pool(
+        pool: &[OctreeNode],
+        node_idx: usize,
+        bounds: AABB,
+        leaves: &mut Vec<(AABB, Vec<((i64, i64, i64), Couplet)>)>,
+    ) {
+        if node_idx >= pool.len() {
+            return;
+        }
+        match &pool[node_idx] {
+            OctreeNode::Leaf { couplets } => {
+                if !couplets.is_empty() {
+                    leaves.push((bounds, couplets.clone()));
+                }
+            }
+            OctreeNode::Internal { children_indices } => {
+                let mid_x = bounds.min_x + (bounds.max_x - bounds.min_x) / 2;
+                let mid_y = bounds.min_y + (bounds.max_y - bounds.min_y) / 2;
+                let mid_z = bounds.min_z + (bounds.max_z - bounds.min_z) / 2;
+
+                for (i, &child_idx) in children_indices.iter().enumerate() {
+                    let child_bounds = Self::get_child_bounds(bounds, i, mid_x, mid_y, mid_z);
+                    Self::collect_leaves_from_pool(pool, child_idx, child_bounds, leaves);
+                }
+            }
+        }
     }
 
     /// Collects and computes current stability telemetry metrics.
@@ -453,6 +494,20 @@ mod tests {
 
         let t2 = octree.telemetry();
         assert_eq!(t2.aggregate_flux, 1);
+    }
+
+    #[test]
+    fn test_collect_active_leaves() {
+        let bounds = AABB::new(-10, 10, -10, 10, -10, 10);
+        let mut octree = Octree::new(bounds, 1, 4);
+
+        let dna = Tpes::new(2, 2, 1, 1);
+        octree.insert((1, 1, 1), Couplet::new_baseline(dna));
+
+        let active_leaves = octree.collect_active_leaves();
+        assert_eq!(active_leaves.len(), 1);
+        assert_eq!(active_leaves[0].1.len(), 1);
+        assert_eq!(active_leaves[0].1[0].0, (1, 1, 1));
     }
 
     #[test]
