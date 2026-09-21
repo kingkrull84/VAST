@@ -34,6 +34,28 @@ impl AABB {
             && point.2 >= self.min_z
             && point.2 <= self.max_z
     }
+
+    /// Splits this AABB into 8 equal sub-octants (2x2x2 grid).
+    pub fn subdivide(&self) -> [AABB; 8] {
+        let mid_x = self.min_x + (self.max_x - self.min_x) / 2;
+        let mid_y = self.min_y + (self.max_y - self.min_y) / 2;
+        let mid_z = self.min_z + (self.max_z - self.min_z) / 2;
+
+        let mut sub_octants = [AABB::new(0, 0, 0, 0, 0, 0); 8];
+        for i in 0..8 {
+            let min_x = if (i & 4) != 0 { mid_x + 1 } else { self.min_x };
+            let max_x = if (i & 4) != 0 { self.max_x } else { mid_x };
+
+            let min_y = if (i & 2) != 0 { mid_y + 1 } else { self.min_y };
+            let max_y = if (i & 2) != 0 { self.max_y } else { mid_y };
+
+            let min_z = if (i & 1) != 0 { mid_z + 1 } else { self.min_z };
+            let max_z = if (i & 1) != 0 { self.max_z } else { mid_z };
+
+            sub_octants[i] = AABB::new(min_x, max_x, min_y, max_y, min_z, max_z);
+        }
+        sub_octants
+    }
 }
 
 /// Telemetry metrics representing the lattice stability.
@@ -54,9 +76,127 @@ pub enum OctreeNode {
     Leaf {
         couplets: Vec<((i64, i64, i64), Couplet)>,
     },
-    Internal {
+    Branch {
         children_indices: [usize; 8],
     },
+}
+
+impl OctreeNode {
+    /// When called on a Leaf, converts it into a Branch containing 8 default child Leaf nodes
+    /// in the arena pool (representing the sub-octants).
+    pub fn subdivide(&mut self, pool: &mut Vec<OctreeNode>) -> [usize; 8] {
+        match self {
+            OctreeNode::Leaf { couplets } => {
+                let _old_couplets = std::mem::take(couplets);
+                let mut children_indices = [0usize; 8];
+                for i in 0..8 {
+                    let child_idx = pool.len();
+                    pool.push(OctreeNode::Leaf {
+                        couplets: Vec::new(),
+                    });
+                    children_indices[i] = child_idx;
+                }
+                *self = OctreeNode::Branch { children_indices };
+                children_indices
+            }
+            OctreeNode::Branch { children_indices } => *children_indices,
+        }
+    }
+
+    /// Static helper to subdivide a node at a given index in the arena pool.
+    pub fn subdivide_at(pool: &mut Vec<OctreeNode>, node_idx: usize) -> [usize; 8] {
+        if matches!(pool.get(node_idx), Some(OctreeNode::Leaf { .. })) {
+            let mut children_indices = [0usize; 8];
+            for i in 0..8 {
+                let child_idx = pool.len();
+                pool.push(OctreeNode::Leaf {
+                    couplets: Vec::new(),
+                });
+                children_indices[i] = child_idx;
+            }
+            if let OctreeNode::Leaf { couplets } = &mut pool[node_idx] {
+                let _ = std::mem::take(couplets);
+            }
+            pool[node_idx] = OctreeNode::Branch { children_indices };
+            children_indices
+        } else if let Some(OctreeNode::Branch { children_indices }) = pool.get(node_idx) {
+            *children_indices
+        } else {
+            unreachable!()
+        }
+    }
+
+    /// When called on a Branch where all 8 children are Leaves in a uniform resting state (flux = 0),
+    /// merges them back into a single parent Leaf.
+    pub fn collapse(&mut self, pool: &[OctreeNode]) -> bool {
+        if let OctreeNode::Branch { children_indices } = *self {
+            for &child_idx in &children_indices {
+                if child_idx >= pool.len() {
+                    return false;
+                }
+                match &pool[child_idx] {
+                    OctreeNode::Leaf { couplets } => {
+                        for (_, couplet) in couplets {
+                            if couplet.flux.value() != 0 {
+                                return false;
+                            }
+                        }
+                    }
+                    OctreeNode::Branch { .. } => return false,
+                }
+            }
+
+            let mut merged_couplets = Vec::new();
+            for &child_idx in &children_indices {
+                if let OctreeNode::Leaf { couplets } = &pool[child_idx] {
+                    merged_couplets.extend(couplets.clone());
+                }
+            }
+
+            *self = OctreeNode::Leaf {
+                couplets: merged_couplets,
+            };
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Static helper to collapse a node at a given index in the arena pool.
+    pub fn collapse_at(pool: &mut Vec<OctreeNode>, node_idx: usize) -> bool {
+        let children_indices = match pool.get(node_idx) {
+            Some(OctreeNode::Branch { children_indices }) => *children_indices,
+            _ => return false,
+        };
+
+        for &child_idx in &children_indices {
+            if child_idx >= pool.len() {
+                return false;
+            }
+            match &pool[child_idx] {
+                OctreeNode::Leaf { couplets } => {
+                    for (_, couplet) in couplets {
+                        if couplet.flux.value() != 0 {
+                            return false;
+                        }
+                    }
+                }
+                OctreeNode::Branch { .. } => return false,
+            }
+        }
+
+        let mut merged_couplets = Vec::new();
+        for &child_idx in &children_indices {
+            if let OctreeNode::Leaf { couplets } = &pool[child_idx] {
+                merged_couplets.extend(couplets.clone());
+            }
+        }
+
+        pool[node_idx] = OctreeNode::Leaf {
+            couplets: merged_couplets,
+        };
+        true
+    }
 }
 
 /// Sparse Octree utilizing a contiguous 1D memory pool (arena) and strict double-buffering
@@ -136,14 +276,7 @@ impl Octree {
                 let mid_y = bounds.min_y + (bounds.max_y - bounds.min_y) / 2;
                 let mid_z = bounds.min_z + (bounds.max_z - bounds.min_z) / 2;
 
-                let mut children_indices = [0usize; 8];
-                for i in 0..8 {
-                    let child_node_idx = pool.len();
-                    pool.push(OctreeNode::Leaf { couplets: Vec::new() });
-                    children_indices[i] = child_node_idx;
-                }
-
-                pool[node_idx] = OctreeNode::Internal { children_indices };
+                let children_indices = OctreeNode::subdivide_at(pool, node_idx);
 
                 for (p, c) in existing_couplets {
                     let child_slot = Self::get_child_index(p, mid_x, mid_y, mid_z);
@@ -164,7 +297,7 @@ impl Octree {
             }
         } else {
             let children_indices = match &pool[node_idx] {
-                OctreeNode::Internal { children_indices } => *children_indices,
+                OctreeNode::Branch { children_indices } => *children_indices,
                 _ => unreachable!(),
             };
 
@@ -233,7 +366,7 @@ impl Octree {
                 }
                 None
             }
-            OctreeNode::Internal { children_indices } => {
+            OctreeNode::Branch { children_indices } => {
                 let mid_x = bounds.min_x + (bounds.max_x - bounds.min_x) / 2;
                 let mid_y = bounds.min_y + (bounds.max_y - bounds.min_y) / 2;
                 let mid_z = bounds.min_z + (bounds.max_z - bounds.min_z) / 2;
@@ -257,7 +390,7 @@ impl Octree {
                     map.insert(*pos, couplet.pressure);
                 }
             }
-            OctreeNode::Internal { children_indices } => {
+            OctreeNode::Branch { children_indices } => {
                 for &child_idx in children_indices {
                     Self::collect_pressures_from_pool(pool, child_idx, map);
                 }
@@ -267,8 +400,8 @@ impl Octree {
 
     /// Steps simulation strictly using double-buffering.
     /// Reads current state from `read_state`, computes 6-neighbor flux updates into `write_state`,
-    /// and performs `std::mem::swap(&mut self.read_state, &mut self.write_state)` at the end of the tick.
-    pub fn step(&mut self) {
+    /// performs double-buffering swap, and evaluates dynamic octree subdivision/collapse based on flux gradient threshold.
+    pub fn step(&mut self, threshold: u8) {
         let mut pressure_map = HashMap::new();
         Self::collect_pressures_from_pool(&self.read_state, 0, &mut pressure_map);
 
@@ -316,6 +449,103 @@ impl Octree {
 
         // Fast double-buffering pool swap
         std::mem::swap(&mut self.read_state, &mut self.write_state);
+
+        // Dynamic subdivision and collapse post-processing evaluation
+        Self::evaluate_dynamic_nodes(
+            &mut self.read_state,
+            0,
+            self.bounds,
+            threshold,
+            self.max_depth,
+            0,
+        );
+
+        self.write_state = self.read_state.clone();
+    }
+
+    fn evaluate_dynamic_nodes(
+        pool: &mut Vec<OctreeNode>,
+        node_idx: usize,
+        bounds: AABB,
+        threshold: u8,
+        max_depth: usize,
+        current_depth: usize,
+    ) {
+        if node_idx >= pool.len() {
+            return;
+        }
+
+        let is_leaf = matches!(pool[node_idx], OctreeNode::Leaf { .. });
+
+        if is_leaf {
+            let mut should_subdivide = false;
+            let mut couplets_to_redistribute = Vec::new();
+
+            if let OctreeNode::Leaf { couplets } = &pool[node_idx] {
+                if couplets.len() > 1 && current_depth < max_depth {
+                    let max_flux = couplets.iter().map(|(_, c)| c.flux.value()).max().unwrap_or(0);
+                    let min_flux = couplets.iter().map(|(_, c)| c.flux.value()).min().unwrap_or(0);
+                    let gradient = max_flux.saturating_sub(min_flux);
+                    if gradient > threshold {
+                        should_subdivide = true;
+                        couplets_to_redistribute = couplets.clone();
+                    }
+                }
+            }
+
+            if should_subdivide {
+                let mid_x = bounds.min_x + (bounds.max_x - bounds.min_x) / 2;
+                let mid_y = bounds.min_y + (bounds.max_y - bounds.min_y) / 2;
+                let mid_z = bounds.min_z + (bounds.max_z - bounds.min_z) / 2;
+
+                let child_indices = OctreeNode::subdivide_at(pool, node_idx);
+
+                for (p, c) in couplets_to_redistribute {
+                    let slot = Self::get_child_index(p, mid_x, mid_y, mid_z);
+                    let child_idx = child_indices[slot];
+                    if let OctreeNode::Leaf { couplets } = &mut pool[child_idx] {
+                        couplets.push((p, c));
+                    }
+                }
+
+                for i in 0..8 {
+                    let child_idx = child_indices[i];
+                    let child_bounds = Self::get_child_bounds(bounds, i, mid_x, mid_y, mid_z);
+                    Self::evaluate_dynamic_nodes(
+                        pool,
+                        child_idx,
+                        child_bounds,
+                        threshold,
+                        max_depth,
+                        current_depth + 1,
+                    );
+                }
+            }
+        } else {
+            let children_indices = match &pool[node_idx] {
+                OctreeNode::Branch { children_indices } => *children_indices,
+                _ => unreachable!(),
+            };
+
+            let mid_x = bounds.min_x + (bounds.max_x - bounds.min_x) / 2;
+            let mid_y = bounds.min_y + (bounds.max_y - bounds.min_y) / 2;
+            let mid_z = bounds.min_z + (bounds.max_z - bounds.min_z) / 2;
+
+            for i in 0..8 {
+                let child_idx = children_indices[i];
+                let child_bounds = Self::get_child_bounds(bounds, i, mid_x, mid_y, mid_z);
+                Self::evaluate_dynamic_nodes(
+                    pool,
+                    child_idx,
+                    child_bounds,
+                    threshold,
+                    max_depth,
+                    current_depth + 1,
+                );
+            }
+
+            OctreeNode::collapse_at(pool, node_idx);
+        }
     }
 
     /// Collects active leaf regions (AABBs) and active couplets for 3D visual telemetry.
@@ -340,7 +570,7 @@ impl Octree {
                     leaves.push((bounds, couplets.clone()));
                 }
             }
-            OctreeNode::Internal { children_indices } => {
+            OctreeNode::Branch { children_indices } => {
                 let mid_x = bounds.min_x + (bounds.max_x - bounds.min_x) / 2;
                 let mid_y = bounds.min_y + (bounds.max_y - bounds.min_y) / 2;
                 let mid_z = bounds.min_z + (bounds.max_z - bounds.min_z) / 2;
@@ -418,7 +648,7 @@ impl Octree {
                     *aggregate_flux += couplet.flux;
                 }
             }
-            OctreeNode::Internal { children_indices } => {
+            OctreeNode::Branch { children_indices } => {
                 for &child_idx in children_indices {
                     Self::collect_telemetry_from_pool(
                         pool,
@@ -490,7 +720,7 @@ mod tests {
         assert_eq!(t1.aggregate_energy, 1);
         assert_eq!(t1.aggregate_flux, 0);
 
-        octree.step();
+        octree.step(2);
 
         let t2 = octree.telemetry();
         assert_eq!(t2.aggregate_flux, 1);
@@ -524,9 +754,80 @@ mod tests {
         octree.insert((0, 0, 0), c1);
         octree.insert((1, 0, 0), c2);
 
-        octree.step();
+        octree.step(2);
 
         let c2_updated = octree.query((1, 0, 0)).unwrap();
         assert_eq!(c2_updated.flux, Z9::new(7));
+    }
+
+    #[test]
+    fn test_aabb_subdivide() {
+        let bounds = AABB::new(-16, 16, -16, 16, -16, 16);
+        let octants = bounds.subdivide();
+
+        assert_eq!(octants.len(), 8);
+        assert_eq!(octants[0], AABB::new(-16, 0, -16, 0, -16, 0));
+        assert_eq!(octants[7], AABB::new(1, 16, 1, 16, 1, 16));
+    }
+
+    #[test]
+    fn test_octree_node_subdivide_and_collapse() {
+        let mut pool = vec![OctreeNode::Leaf {
+            couplets: Vec::new(),
+        }];
+
+        let children = OctreeNode::subdivide_at(&mut pool, 0);
+        assert_eq!(children.len(), 8);
+        assert_eq!(pool.len(), 9);
+        assert!(matches!(pool[0], OctreeNode::Branch { .. }));
+
+        // All children are leaves in uniform resting state (flux = 0)
+        let collapsed = OctreeNode::collapse_at(&mut pool, 0);
+        assert!(collapsed);
+        assert!(matches!(pool[0], OctreeNode::Leaf { .. }));
+    }
+
+    #[test]
+    fn test_octree_node_collapse_fails_when_active() {
+        let mut pool = vec![OctreeNode::Leaf {
+            couplets: Vec::new(),
+        }];
+
+        let children = OctreeNode::subdivide_at(&mut pool, 0);
+
+        // Inject active couplet (flux != 0) into child 0
+        let dna = Tpes::new(2, 2, 1, 1);
+        let mut active_couplet = Couplet::new_baseline(dna);
+        active_couplet.flux = Z9::new(5);
+
+        if let OctreeNode::Leaf { ref mut couplets } = pool[children[0]] {
+            couplets.push(((1, 1, 1), active_couplet));
+        }
+
+        let collapsed = OctreeNode::collapse_at(&mut pool, 0);
+        assert!(!collapsed);
+        assert!(matches!(pool[0], OctreeNode::Branch { .. }));
+    }
+
+    #[test]
+    fn test_dynamic_step_subdivision() {
+        let bounds = AABB::new(-10, 10, -10, 10, -10, 10);
+        let mut octree = Octree::new(bounds, 10, 4);
+
+        let dna = Tpes::new(2, 2, 1, 1);
+        let mut c1 = Couplet::new_baseline(dna);
+        let c2 = Couplet::new_baseline(dna);
+
+        c1.pressure = Z9::new(8);
+
+        octree.insert((1, 1, 1), c1);
+        octree.insert((5, 5, 5), c2);
+
+        // Step with flux threshold = 2
+        octree.step(2);
+
+        let t = octree.telemetry();
+        assert_eq!(t.total_couplets, 2);
+        assert!(t.max_depth > 0);
     }
 }
