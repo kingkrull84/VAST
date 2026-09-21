@@ -47,11 +47,9 @@ impl Tpes {
         self.positrons as i32 - self.electrons as i32
     }
 
-    /// Net exhaust calculation based on particle total activity, tier, and phase.
-    /// Calculated as total particles (P + E) scaled by phase and tier factor.
+    /// Net exhaust: Net directional flux flow (Positrons - Electrons).
     pub fn net_exhaust(&self) -> i32 {
-        let total_particles = self.positrons as i32 + self.electrons as i32;
-        total_particles * (self.phase as i32 + 1) * (self.tier as i32 + 1)
+        self.positrons as i32 - self.electrons as i32
     }
 }
 
@@ -102,7 +100,6 @@ mod tests {
     #[test]
     fn test_net_exhaust() {
         let proton = Tpes::new(2, 2, 1, 1);
-        // (2 + 1) * (1 + 1) * (2 + 1) = 3 * 2 * 3 = 18
-        assert_eq!(proton.net_exhaust(), 18);
+        assert_eq!(proton.net_exhaust(), 1);
     }
 }

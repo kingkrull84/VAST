@@ -1,5 +1,6 @@
 use crate::lattice::couplet::Couplet;
 use crate::uss::Z9;
+use std::collections::HashMap;
 
 /// 3D Spatial Bounding Box in integer coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +93,6 @@ impl Octree {
     ) -> bool {
         match node {
             OctreeNode::Leaf { couplets } => {
-                // If there's an existing couplet at the exact same position, update it
                 for (p, c) in couplets.iter_mut() {
                     if *p == pos {
                         *c = couplet;
@@ -104,7 +104,6 @@ impl Octree {
                     couplets.push((pos, couplet));
                     true
                 } else {
-                    // Subdivide into 2x2x2 children
                     let mut existing = std::mem::take(couplets);
                     existing.push((pos, couplet));
 
@@ -210,21 +209,61 @@ impl Octree {
         }
     }
 
-    /// Steps simulation by updating flux state of all couplets inside the octree using Z/9Z arithmetic.
-    pub fn step(&mut self) {
-        Self::step_node(&mut self.root);
-    }
-
-    fn step_node(node: &mut OctreeNode) {
+    /// Collects all active couplet positions and pressures into a hash map.
+    fn collect_pressures(node: &OctreeNode, map: &mut HashMap<(i64, i64, i64), Z9>) {
         match node {
             OctreeNode::Leaf { couplets } => {
-                for (_, couplet) in couplets {
-                    couplet.step_flux();
+                for (pos, couplet) in couplets {
+                    map.insert(*pos, couplet.pressure);
+                }
+            }
+            OctreeNode::Internal { children } => {
+                for child in children.iter() {
+                    Self::collect_pressures(child, map);
+                }
+            }
+        }
+    }
+
+    /// Steps simulation by updating flux state of all couplets inside the octree using Z/9Z arithmetic,
+    /// incorporating 6-neighbor stencil lookup for adjacent pressure transfer.
+    pub fn step(&mut self) {
+        let mut pressure_map = HashMap::new();
+        Self::collect_pressures(&self.root, &mut pressure_map);
+        Self::step_node(&mut self.root, &pressure_map);
+    }
+
+    fn step_node(node: &mut OctreeNode, pressure_map: &HashMap<(i64, i64, i64), Z9>) {
+        match node {
+            OctreeNode::Leaf { couplets } => {
+                let neighbor_offsets: [(i64, i64, i64); 6] = [
+                    (1, 0, 0),
+                    (-1, 0, 0),
+                    (0, 1, 0),
+                    (0, -1, 0),
+                    (0, 0, 1),
+                    (0, 0, -1),
+                ];
+
+                for (pos, couplet) in couplets {
+                    // Accumulate pressure from 6 adjacent neighbors in Z/9Z ring
+                    let mut neighbor_pressure = Z9::ZERO;
+                    for offset in &neighbor_offsets {
+                        let n_pos = (pos.0 + offset.0, pos.1 + offset.1, pos.2 + offset.2);
+                        if let Some(&p) = pressure_map.get(&n_pos) {
+                            neighbor_pressure += p;
+                        }
+                    }
+
+                    // Update couplet flux with local energy and combined (local + neighbor) pressure
+                    let total_pressure = couplet.pressure + neighbor_pressure;
+                    couplet.flux = Z9::update_flux(couplet.energy, total_pressure);
+                    couplet.pressure += Z9::ONE;
                 }
             }
             OctreeNode::Internal { children } => {
                 for child in children.iter_mut() {
-                    Self::step_node(child);
+                    Self::step_node(child, pressure_map);
                 }
             }
         }
@@ -359,5 +398,29 @@ mod tests {
 
         let t2 = octree.telemetry();
         assert_eq!(t2.aggregate_flux, 1);
+    }
+
+    #[test]
+    fn test_6_neighbor_stencil_flux_transfer() {
+        let bounds = AABB::new(-10, 10, -10, 10, -10, 10);
+        let mut octree = Octree::new(bounds, 10, 4);
+
+        let dna = Tpes::new(2, 2, 1, 1);
+        let mut c1 = Couplet::new_baseline(dna);
+        let c2 = Couplet::new_baseline(dna);
+
+        c1.pressure = Z9::new(3); // set c1 pressure to 3
+
+        octree.insert((0, 0, 0), c1);
+        octree.insert((1, 0, 0), c2); // adjacent along x-axis
+
+        // Before step, c2 has energy=1, pressure=0
+        // During step, c2 perceives neighbor pressure 3 from c1 at (0,0,0)
+        // total_pressure for c2 = 0 + 3 = 3
+        // flux for c2 = (1 + 3 * 2) mod 9 = 7 mod 9 = 7
+        octree.step();
+
+        let c2_updated = octree.query((1, 0, 0)).unwrap();
+        assert_eq!(c2_updated.flux, Z9::new(7));
     }
 }
