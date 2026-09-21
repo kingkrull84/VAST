@@ -1,0 +1,8 @@
+[package]
+name = "vast_app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+vast_core = { path = "../vast_core" }
+vast_viz = { path = "../vast_viz" }
