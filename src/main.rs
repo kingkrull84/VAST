@@ -1,10 +1,12 @@
 pub mod lattice;
 pub mod stamp;
+pub mod telemetry_rerun;
 pub mod tpes;
 pub mod uss;
 
 use lattice::octree::{Octree, AABB};
 use stamp::stamp_proton_triad;
+use telemetry_rerun::TelemetryRerun;
 
 fn main() {
     println!("=== VAST Engine Simulation Starting ===");
@@ -20,9 +22,26 @@ fn main() {
     stamp_proton_triad(&mut octree, origin);
     println!("Stamped Proton Triad (2:2:1:1) at origin {:?}", origin);
 
-    // Initial telemetry reading
+    // Initialize 3D Visual Telemetry Viewport (Rerun)
+    let rerun_telemetry = match TelemetryRerun::new("VAST Simulation Engine") {
+        Ok(t) => {
+            println!("Initialized Rerun 3D Visual Telemetry stream.");
+            Some(t)
+        }
+        Err(e) => {
+            eprintln!("Failed to initialize Rerun telemetry: {}", e);
+            None
+        }
+    };
+
+    // Initial telemetry reading & Rerun log
     let initial_telemetry = octree.telemetry();
     println!("Initial Telemetry: {:?}", initial_telemetry);
+    if let Some(ref t) = rerun_telemetry {
+        if let Err(e) = t.log_step(0, &octree) {
+            eprintln!("Error logging initial Rerun telemetry: {}", e);
+        }
+    }
 
     // Simulation cycles stepping through discrete Z/9Z flux updates
     let total_cycles = 5;
@@ -30,6 +49,12 @@ fn main() {
         octree.step();
         let telemetry = octree.telemetry();
         println!("Cycle {:02} Telemetry: {:?}", cycle, telemetry);
+
+        if let Some(ref t) = rerun_telemetry {
+            if let Err(e) = t.log_step(cycle, &octree) {
+                eprintln!("Error logging cycle {} Rerun telemetry: {}", cycle, e);
+            }
+        }
     }
 
     println!("=== VAST Engine Simulation Completed Successfully ===");
