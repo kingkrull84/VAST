@@ -5,4 +5,4 @@ edition = "2024"
 
 [dependencies]
 rayon = "1.12.0"
-rerun = "0.34.1"
+rerun = { version = "*", features = ["native_viewer"] }

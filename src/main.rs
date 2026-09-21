@@ -58,4 +58,8 @@ fn main() {
     }
 
     println!("=== VAST Engine Simulation Completed Successfully ===");
+
+    println!("\n3D Viewport is running. Press Enter in this terminal to exit...");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).ok();
 }
