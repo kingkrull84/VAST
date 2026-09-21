@@ -1,12 +1,6 @@
-pub mod lattice;
-pub mod stamp;
-pub mod telemetry_rerun;
-pub mod tpes;
-pub mod uss;
-
-use lattice::octree::{Octree, AABB};
-use stamp::stamp_proton_triad;
-use telemetry_rerun::TelemetryRerun;
+use vast_core::lattice::octree::{Octree, AABB};
+use vast_core::stamp::stamp_proton_triad;
+use vast_viz::TelemetryRerun;
 
 fn main() {
     println!("=== VAST Engine Simulation Starting ===");

@@ -1,8 +1,3 @@
-[package]
-name = "vast"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-rayon = "1.12.0"
-rerun = { version = "*", features = ["native_viewer"] }
+[workspace]
+members = ["crates/vast_core", "crates/vast_viz", "crates/vast_app"]
+resolver = "2"

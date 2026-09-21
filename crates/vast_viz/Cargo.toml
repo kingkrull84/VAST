@@ -1,0 +1,8 @@
+[package]
+name = "vast_viz"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rerun = { version = "*", features = ["native_viewer"] }
+vast_core = { path = "../vast_core" }

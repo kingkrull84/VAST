@@ -1,4 +1,4 @@
-use crate::lattice::octree::Octree;
+use vast_core::lattice::octree::Octree;
 use rerun::{Boxes3D, Color, Points3D, RecordingStream, RecordingStreamBuilder};
 
 pub struct TelemetryRerun {
