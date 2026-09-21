@@ -3,6 +3,51 @@ use crate::uss::Z9;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+/// D3Q27 discrete velocity directional vectors (dx, dy, dz) where dx, dy, dz in {-1, 0, 1}.
+pub const DIRECTION_VECTORS: [(i64, i64, i64); 27] = [
+    (-1, -1, -1), (-1, -1, 0), (-1, -1, 1),
+    (-1,  0, -1), (-1,  0, 0), (-1,  0, 1),
+    (-1,  1, -1), (-1,  1, 0), (-1,  1, 1),
+    ( 0, -1, -1), ( 0, -1, 0), ( 0, -1, 1),
+    ( 0,  0, -1), ( 0,  0, 0), ( 0,  0, 1),
+    ( 0,  1, -1), ( 0,  1, 0), ( 0,  1, 1),
+    ( 1, -1, -1), ( 1, -1, 0), ( 1, -1, 1),
+    ( 1,  0, -1), ( 1,  0, 0), ( 1,  0, 1),
+    ( 1,  1, -1), ( 1,  1, 0), ( 1,  1, 1),
+];
+
+/// Converts 3D discrete direction vector (dx, dy, dz) to D3Q27 array index in 0..27.
+pub fn direction_to_index(dx: i64, dy: i64, dz: i64) -> usize {
+    ((dx + 1) * 9 + (dy + 1) * 3 + (dz + 1)) as usize
+}
+
+/// Computes a pair of orthogonal direction indices (o1, o2) for a given direction index k.
+pub fn get_orthogonal_pair(k: usize) -> (usize, usize) {
+    let dir = DIRECTION_VECTORS[k];
+    let dx = dir.0;
+    let dy = dir.1;
+    let dz = dir.2;
+
+    let o1_vec = if dx != 0 || dy != 0 {
+        (-dy, dx, 0)
+    } else {
+        (1, 0, 0)
+    };
+
+    let v2 = (
+        dy * o1_vec.2 - dz * o1_vec.1,
+        dz * o1_vec.0 - dx * o1_vec.2,
+        dx * o1_vec.1 - dy * o1_vec.0,
+    );
+
+    let o2_vec = (-v2.0.signum(), -v2.1.signum(), -v2.2.signum());
+
+    (
+        direction_to_index(o1_vec.0, o1_vec.1, o1_vec.2),
+        direction_to_index(o2_vec.0, o2_vec.1, o2_vec.2),
+    )
+}
+
 /// 3D Spatial Bounding Box in integer coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AABB {
@@ -137,7 +182,7 @@ impl OctreeNode {
                 match &pool[child_idx] {
                     OctreeNode::Leaf { couplets } => {
                         for (_, couplet) in couplets {
-                            if couplet.flux.value() != 0 {
+                            if couplet.total_flux().value() != 0 {
                                 return false;
                             }
                         }
@@ -176,7 +221,7 @@ impl OctreeNode {
             match &pool[child_idx] {
                 OctreeNode::Leaf { couplets } => {
                     for (_, couplet) in couplets {
-                        if couplet.flux.value() != 0 {
+                        if couplet.total_flux().value() != 0 {
                             return false;
                         }
                     }
@@ -379,40 +424,31 @@ impl Octree {
         }
     }
 
-    /// Collects all active couplet positions and pressures into a hash map from the read pool.
-    fn collect_pressures_from_pool(pool: &[OctreeNode], node_idx: usize, map: &mut HashMap<(i64, i64, i64), Z9>) {
+    /// Collects all active couplets into a hash map from the read pool.
+    fn collect_couplets_from_pool(pool: &[OctreeNode], node_idx: usize, map: &mut HashMap<(i64, i64, i64), Couplet>) {
         if node_idx >= pool.len() {
             return;
         }
         match &pool[node_idx] {
             OctreeNode::Leaf { couplets } => {
                 for (pos, couplet) in couplets {
-                    map.insert(*pos, couplet.pressure);
+                    map.insert(*pos, couplet.clone());
                 }
             }
             OctreeNode::Branch { children_indices } => {
                 for &child_idx in children_indices {
-                    Self::collect_pressures_from_pool(pool, child_idx, map);
+                    Self::collect_couplets_from_pool(pool, child_idx, map);
                 }
             }
         }
     }
 
-    /// Steps simulation strictly using double-buffering.
-    /// Reads current state from `read_state`, computes 6-neighbor flux updates into `write_state`,
-    /// performs double-buffering swap, and evaluates dynamic octree subdivision/collapse based on flux gradient threshold.
+    /// Steps simulation strictly using double-buffering and D3Q27 Lattice Boltzmann dynamics.
+    /// Reads current state from `read_state`, performs directional advection, topological sink pulling,
+    /// and orthogonal scattering into `write_state`, then evaluates dynamic subdivision/collapse.
     pub fn step(&mut self, threshold: u8) {
-        let mut pressure_map = HashMap::new();
-        Self::collect_pressures_from_pool(&self.read_state, 0, &mut pressure_map);
-
-        let neighbor_offsets: [(i64, i64, i64); 6] = [
-            (1, 0, 0),
-            (-1, 0, 0),
-            (0, 1, 0),
-            (0, -1, 0),
-            (0, 0, 1),
-            (0, 0, -1),
-        ];
+        let mut read_map = HashMap::new();
+        Self::collect_couplets_from_pool(&self.read_state, 0, &mut read_map);
 
         // Ensure write_state matches topology of read_state
         if self.write_state.len() != self.read_state.len() {
@@ -429,20 +465,59 @@ impl Octree {
                 ) = (read_node, write_node)
                 {
                     for (i, (pos, read_couplet)) in read_couplets.iter().enumerate() {
-                        let mut neighbor_pressure = Z9::ZERO;
-                        for offset in &neighbor_offsets {
-                            let n_pos = (pos.0 + offset.0, pos.1 + offset.1, pos.2 + offset.2);
-                            if let Some(&p) = pressure_map.get(&n_pos) {
-                                neighbor_pressure += p;
+                        let mut advected_flux = [Z9::ZERO; 27];
+
+                        // Step 1: Directional Advection
+                        for k in 0..27 {
+                            let dir = DIRECTION_VECTORS[k];
+                            let source_pos = (pos.0 - dir.0, pos.1 - dir.1, pos.2 - dir.2);
+                            if let Some(source_couplet) = read_map.get(&source_pos) {
+                                advected_flux[k] = source_couplet.flux[k];
                             }
                         }
 
-                        let total_pressure = read_couplet.pressure + neighbor_pressure;
-                        let next_flux = Z9::update_flux(read_couplet.energy, total_pressure);
-                        let next_pressure = read_couplet.pressure + Z9::ONE;
+                        // Step 2: Topological Sink (Electron) vs Base Node Flux
+                        if read_couplet.particle_dna.net_charge() < 0 || read_couplet.id == 1 {
+                            // Electron Topological Sink: pull flux from poles (+Z: k=14, -Z: k=12)
+                            let polar_flux = advected_flux[14] + advected_flux[12];
+                            advected_flux[14] = Z9::ZERO;
+                            advected_flux[12] = Z9::ZERO;
 
-                        write_couplets[i].1.flux = next_flux;
-                        write_couplets[i].1.pressure = next_pressure;
+                            let base_flux = Z9::update_flux(read_couplet.energy, read_couplet.pressure);
+                            let total_scatter = polar_flux + base_flux;
+
+                            let val = total_scatter.value();
+                            let q = val / 4;
+                            let r = val % 4;
+                            let b_indices = [22, 4, 16, 10]; // +X, -X, +Y, -Y
+                            for (b_i, &idx) in b_indices.iter().enumerate() {
+                                let add_amount = q + if (b_i as u8) < r { 1 } else { 0 };
+                                advected_flux[idx] += Z9::new(add_amount as i32);
+                            }
+                        } else {
+                            // Base node flux generation added to rest bucket (k=13)
+                            let base_flux = Z9::update_flux(read_couplet.energy, read_couplet.pressure);
+                            advected_flux[13] += base_flux;
+                        }
+
+                        // Step 3: Orthogonal Scattering for opposing flux packets
+                        for k in 0..13 {
+                            let k_opp = 26 - k;
+                            let f1 = advected_flux[k].value();
+                            let f2 = advected_flux[k_opp].value();
+                            if f1 > 0 && f2 > 0 {
+                                let c = f1.min(f2);
+                                let c_z9 = Z9::new(c as i32);
+                                advected_flux[k] -= c_z9;
+                                advected_flux[k_opp] -= c_z9;
+                                let (o1, o2) = get_orthogonal_pair(k);
+                                advected_flux[o1] += c_z9;
+                                advected_flux[o2] += c_z9;
+                            }
+                        }
+
+                        write_couplets[i].1.flux = advected_flux;
+                        write_couplets[i].1.pressure = read_couplet.pressure + Z9::ONE;
                     }
                 }
             });
@@ -483,8 +558,8 @@ impl Octree {
 
             if let OctreeNode::Leaf { couplets } = &pool[node_idx] {
                 if couplets.len() > 1 && current_depth < max_depth {
-                    let max_flux = couplets.iter().map(|(_, c)| c.flux.value()).max().unwrap_or(0);
-                    let min_flux = couplets.iter().map(|(_, c)| c.flux.value()).min().unwrap_or(0);
+                    let max_flux = couplets.iter().map(|(_, c)| c.total_flux().value()).max().unwrap_or(0);
+                    let min_flux = couplets.iter().map(|(_, c)| c.total_flux().value()).min().unwrap_or(0);
                     let gradient = max_flux.saturating_sub(min_flux);
                     if gradient > threshold {
                         should_subdivide = true;
@@ -645,7 +720,7 @@ impl Octree {
                     *total_net_charge += couplet.particle_dna.net_charge();
                     *total_net_exhaust += couplet.particle_dna.net_exhaust();
                     *aggregate_energy += couplet.energy;
-                    *aggregate_flux += couplet.flux;
+                    *aggregate_flux += couplet.total_flux();
                 }
             }
             OctreeNode::Branch { children_indices } => {
@@ -741,23 +816,47 @@ mod tests {
     }
 
     #[test]
-    fn test_6_neighbor_stencil_flux_transfer() {
+    fn test_directional_advection_and_scattering() {
         let bounds = AABB::new(-10, 10, -10, 10, -10, 10);
         let mut octree = Octree::new(bounds, 10, 4);
 
         let dna = Tpes::new(2, 2, 1, 1);
         let mut c1 = Couplet::new_baseline(dna);
-        let c2 = Couplet::new_baseline(dna);
-
-        c1.pressure = Z9::new(3);
+        let idx_plus_x = direction_to_index(1, 0, 0);
+        c1.flux[idx_plus_x] = Z9::new(5);
 
         octree.insert((0, 0, 0), c1);
-        octree.insert((1, 0, 0), c2);
+        octree.insert((1, 0, 0), Couplet::new_baseline(dna));
 
         octree.step(2);
 
+        // Flux in +X direction should advect from (0,0,0) to (1,0,0)
         let c2_updated = octree.query((1, 0, 0)).unwrap();
-        assert_eq!(c2_updated.flux, Z9::new(7));
+        assert_eq!(c2_updated.flux[idx_plus_x], Z9::new(5));
+
+        // Test collision scattering on opposing directions (+X and -X)
+        let mut octree_collide = Octree::new(bounds, 10, 4);
+        let mut c_left = Couplet::new_baseline(dna);
+        let mut c_right = Couplet::new_baseline(dna);
+        let idx_minus_x = direction_to_index(-1, 0, 0);
+
+        c_left.flux[idx_plus_x] = Z9::new(3);
+        c_right.flux[idx_minus_x] = Z9::new(3);
+
+        octree_collide.insert((-1, 0, 0), c_left);
+        octree_collide.insert((1, 0, 0), c_right);
+        octree_collide.insert((0, 0, 0), Couplet::new_baseline(dna));
+
+        octree_collide.step(2);
+
+        let c_after = octree_collide.query((0, 0, 0)).unwrap();
+        // Opposing +X and -X of equal magnitude (3) streaming from (-1,0,0) and (1,0,0) collide at (0,0,0)
+        // and scatter to orthogonal directions (-Y and -Z)
+        assert_eq!(c_after.flux[idx_plus_x], Z9::ZERO);
+        assert_eq!(c_after.flux[idx_minus_x], Z9::ZERO);
+        let (o1, o2) = get_orthogonal_pair(idx_minus_x);
+        assert_eq!(c_after.flux[o1], Z9::new(3));
+        assert_eq!(c_after.flux[o2], Z9::new(3));
     }
 
     #[test]
@@ -798,7 +897,7 @@ mod tests {
         // Inject active couplet (flux != 0) into child 0
         let dna = Tpes::new(2, 2, 1, 1);
         let mut active_couplet = Couplet::new_baseline(dna);
-        active_couplet.flux = Z9::new(5);
+        active_couplet.flux[22] = Z9::new(5);
 
         if let OctreeNode::Leaf { ref mut couplets } = pool[children[0]] {
             couplets.push(((1, 1, 1), active_couplet));
