@@ -10,7 +10,7 @@ pub struct Couplet {
     pub particle_dna: Tpes,
     pub energy: Z9,
     pub pressure: Z9,
-    pub flux: Z9,
+    pub flux: [Z9; 27],
 }
 
 impl Couplet {
@@ -23,7 +23,7 @@ impl Couplet {
             particle_dna,
             energy: Z9::new(particle_dna.net_charge().abs()),
             pressure: Z9::ZERO,
-            flux: Z9::ZERO,
+            flux: [Z9::ZERO; 27],
         }
     }
 
@@ -47,9 +47,14 @@ impl Couplet {
         ((pos1.0 - pos2.0).abs() + (pos1.1 - pos2.1).abs() + (pos1.2 - pos2.2).abs()) as u64
     }
 
-    /// Updates discrete flux state based on Z/9Z ring mechanics.
+    /// Computes the aggregate Z9 flux across all 27 directional headings.
+    pub fn total_flux(&self) -> Z9 {
+        self.flux.iter().fold(Z9::ZERO, |acc, &f| acc + f)
+    }
+
+    /// Updates discrete flux state based on Z/9Z ring mechanics across all headings.
     pub fn step_flux(&mut self) {
-        self.flux = Z9::update_flux(self.energy, self.pressure);
+        self.flux = [Z9::update_flux(self.energy, self.pressure); 27];
         // Discrete pressure cycle shift
         self.pressure += Z9::ONE;
     }
@@ -87,13 +92,13 @@ mod tests {
         assert_eq!(couplet.pressure, Z9::ZERO);
 
         couplet.step_flux();
-        // flux = 1 + 0*2 = 1, pressure becomes 1
-        assert_eq!(couplet.flux, Z9::new(1));
+        // flux = 1 + 0*2 = 1 across all 27 headings, pressure becomes 1
+        assert_eq!(couplet.flux, [Z9::new(1); 27]);
         assert_eq!(couplet.pressure, Z9::new(1));
 
         couplet.step_flux();
-        // flux = 1 + 1*2 = 3, pressure becomes 2
-        assert_eq!(couplet.flux, Z9::new(3));
+        // flux = 1 + 1*2 = 3 across all 27 headings, pressure becomes 2
+        assert_eq!(couplet.flux, [Z9::new(3); 27]);
         assert_eq!(couplet.pressure, Z9::new(2));
     }
 

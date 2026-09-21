@@ -1,5 +1,5 @@
 use vast_core::lattice::octree::{Octree, AABB};
-use vast_core::stamp::stamp_proton_triad;
+use vast_core::stamp::stamp_electron;
 use vast_viz::TelemetryRerun;
 
 fn main() {
@@ -11,10 +11,10 @@ fn main() {
 
     println!("Initialized Sparse Octree lattice bounds: {:?}", bounds);
 
-    // Inject Proton triad (T:2, P:2, E:1, S:1) into ID 2 couplet space at origin
+    // Inject Electron (T:1, P:0, E:1, S:1) into ID 1 vacuum couplet space at origin
     let origin = (0, 0, 0);
-    stamp_proton_triad(&mut octree, origin);
-    println!("Stamped Proton Triad (2:2:1:1) at origin {:?}", origin);
+    stamp_electron(&mut octree, origin);
+    println!("Stamped Electron (1:0:1:1) at origin {:?}", origin);
 
     // Initialize 3D Visual Telemetry Viewport (Rerun)
     let rerun_telemetry = match TelemetryRerun::new("VAST Simulation Engine") {

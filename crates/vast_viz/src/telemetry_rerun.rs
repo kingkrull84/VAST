@@ -49,7 +49,7 @@ impl TelemetryRerun {
 
             for (pos, couplet) in couplets {
                 positions.push((pos.0 as f32, pos.1 as f32, pos.2 as f32));
-                let flux_val = couplet.flux.value();
+                let flux_val = couplet.total_flux().value();
                 colors.push(flux_to_color(flux_val));
                 labels.push(format!("{}", flux_val));
             }
