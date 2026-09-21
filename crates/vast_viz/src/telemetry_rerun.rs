@@ -1,5 +1,6 @@
 use vast_core::lattice::octree::Octree;
-use rerun::{Boxes3D, Color, Points3D, RecordingStream, RecordingStreamBuilder};
+use rerun::blueprint::{Blueprint, BlueprintActivation, Spatial3DView};
+use rerun::{Boxes3D, Color, FillMode, Points3D, RecordingStream, RecordingStreamBuilder};
 
 pub struct TelemetryRerun {
     rec: RecordingStream,
@@ -8,6 +9,18 @@ pub struct TelemetryRerun {
 impl TelemetryRerun {
     pub fn new(app_name: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let rec = RecordingStreamBuilder::new(app_name).spawn()?;
+
+        let view = Spatial3DView::new("3D Space View")
+            .with_origin("/")
+            .with_contents(["/**"]);
+        let blueprint = Blueprint::new(view);
+        blueprint.send(&rec, BlueprintActivation::default())?;
+
+        // Set default bounds to (-16, 16) centered at origin (0,0,0)
+        let default_bounds = Boxes3D::from_centers_and_half_sizes([(0.0, 0.0, 0.0)], [(16.0, 16.0, 16.0)])
+            .with_fill_mode(FillMode::MajorWireframe);
+        rec.log_static("world/bounds", &default_bounds)?;
+
         Ok(Self { rec })
     }
 
@@ -18,6 +31,7 @@ impl TelemetryRerun {
 
         let mut positions = Vec::new();
         let mut colors = Vec::new();
+        let mut labels = Vec::new();
         let mut box_centers = Vec::new();
         let mut box_half_sizes = Vec::new();
 
@@ -37,16 +51,21 @@ impl TelemetryRerun {
                 positions.push((pos.0 as f32, pos.1 as f32, pos.2 as f32));
                 let flux_val = couplet.flux.value();
                 colors.push(flux_to_color(flux_val));
+                labels.push(format!("{}", flux_val));
             }
         }
 
         if !positions.is_empty() {
-            let points = Points3D::new(positions).with_colors(colors);
+            let points = Points3D::new(positions)
+                .with_colors(colors)
+                .with_radii([0.5])
+                .with_labels(labels);
             self.rec.log("world/couplets", &points)?;
         }
 
         if !box_centers.is_empty() {
-            let boxes = Boxes3D::from_centers_and_half_sizes(box_centers, box_half_sizes);
+            let boxes = Boxes3D::from_centers_and_half_sizes(box_centers, box_half_sizes)
+                .with_fill_mode(FillMode::MajorWireframe);
             self.rec.log("world/leaf_regions", &boxes)?;
         }
 

@@ -40,7 +40,7 @@ fn main() {
     // Simulation cycles stepping through discrete Z/9Z flux updates
     let total_cycles = 5;
     for cycle in 1..=total_cycles {
-        octree.step();
+        octree.step(2);
         let telemetry = octree.telemetry();
         println!("Cycle {:02} Telemetry: {:?}", cycle, telemetry);
 
