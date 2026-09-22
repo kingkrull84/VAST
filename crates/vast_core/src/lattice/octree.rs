@@ -291,10 +291,10 @@ impl Octree {
         let cap = self.capacity;
         let max_d = self.max_depth;
 
-        let inserted = Self::insert_into_pool(&mut self.read_state, 0, bounds, pos, couplet, cap, max_d, 0);
+        let inserted = Self::insert_into_pool(&mut self.read_state, 0, bounds, pos, couplet.clone(), cap, max_d, 0);
         if inserted {
             // Keep write_state synchronized with read_state topology and couplet state
-            self.write_state = self.read_state.clone();
+            Self::insert_into_pool(&mut self.write_state, 0, bounds, pos, couplet, cap, max_d, 0);
         }
         inserted
     }
@@ -447,7 +447,7 @@ impl Octree {
         }
         let deleted = Self::delete_from_pool(&mut self.read_state, 0, self.bounds, pos);
         if deleted {
-            self.write_state = self.read_state.clone();
+            Self::delete_from_pool(&mut self.write_state, 0, self.bounds, pos);
         }
         deleted
     }

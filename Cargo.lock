@@ -5889,7 +5889,9 @@ dependencies = [
  "bytes",
  "libc",
  "mio 1.2.3",
+ "parking_lot",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2 0.6.5",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -6216,6 +6218,7 @@ dependencies = [
 name = "vast_app"
 version = "0.1.0"
 dependencies = [
+ "tokio",
  "vast_core",
  "vast_viz",
 ]

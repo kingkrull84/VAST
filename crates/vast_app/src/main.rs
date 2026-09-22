@@ -5,6 +5,19 @@ use vast_core::tpes::Tpes;
 use vast_viz::TelemetryRerun;
 
 fn main() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime");
+
+    rt.block_on(async {
+        run_simulation().await;
+    });
+
+    rt.shutdown_background();
+}
+
+async fn run_simulation() {
     println!("=== VAST Engine Simulation Starting ===");
 
     // Define 3D bounding box for simulation space (-16..16 on all axes)
@@ -30,13 +43,17 @@ fn main() {
     println!("Stamped Electron (1:0:1:1) at origin {:?}", origin);
 
     // Initialize 3D Visual Telemetry Viewport (Rerun)
-    let rerun_telemetry = match TelemetryRerun::new("VAST Simulation Engine") {
-        Ok(t) => {
+    let rerun_telemetry = match tokio::task::spawn_blocking(|| TelemetryRerun::new("VAST Simulation Engine").map_err(|e| e.to_string())).await {
+        Ok(Ok(t)) => {
             println!("Initialized Rerun 3D Visual Telemetry stream.");
             Some(t)
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!("Failed to initialize Rerun telemetry: {}", e);
+            None
+        }
+        Err(e) => {
+            eprintln!("Task error initializing Rerun telemetry: {}", e);
             None
         }
     };
@@ -65,8 +82,4 @@ fn main() {
     }
 
     println!("=== VAST Engine Simulation Completed Successfully ===");
-
-    println!("\n3D Viewport is running. Press Enter in this terminal to exit...");
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).ok();
 }
