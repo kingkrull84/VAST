@@ -557,7 +557,7 @@ impl Octree {
         }
 
         // Toroidal Boundary Recycling: inject new ID 2 couplets at outer boundary shell
-        let element_zero_dna = crate::tpes::Tpes::new(0, 0, 0, 0);
+        let element_zero_dna = crate::tpes::Tpes::new(2, 2, 1, 1);
         for boundary_pos in recycled_boundary_positions {
             let cap = self.capacity;
             let max_d = self.max_depth;
@@ -1095,7 +1095,7 @@ mod tests {
         stamp_electron(&mut octree, (0, 0, 0));
 
         // Insert ID 2 Space couplet adjacent at (1, 0, 0)
-        let element_zero_dna = Tpes::new(0, 0, 0, 0);
+        let element_zero_dna = Tpes::new(2, 2, 1, 1);
         octree.insert((1, 0, 0), Couplet::new_baseline(element_zero_dna));
 
         assert_eq!(octree.telemetry().total_couplets, 2);
@@ -1126,7 +1126,7 @@ mod tests {
 
         stamp_electron(&mut octree, (0, 0, 0));
 
-        let element_zero_dna = Tpes::new(0, 0, 0, 0);
+        let element_zero_dna = Tpes::new(2, 2, 1, 1);
         // Insert ID 2 node at dist = 2 (close to drain)
         octree.insert((2, 0, 0), Couplet::new_baseline(element_zero_dna));
 
