@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rerun = { version = "*", default-features = false, features = ["sdk"] }
+rerun = { version = "0.15.1", features = ["web_viewer"] }
 vast_core = { path = "../vast_core" }

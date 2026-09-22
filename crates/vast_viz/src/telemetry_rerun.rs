@@ -1,5 +1,4 @@
 use vast_core::lattice::octree::Octree;
-use rerun::blueprint::{Blueprint, BlueprintActivation, Spatial3DView};
 use rerun::{Boxes3D, Color, Points3D, RecordingStream, RecordingStreamBuilder};
 
 pub struct TelemetryRerun {
@@ -9,13 +8,13 @@ pub struct TelemetryRerun {
 impl TelemetryRerun {
     pub fn new(app_name: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let rec = RecordingStreamBuilder::new(app_name);
-        let rec = rec.spawn()?;
-
-        let view = Spatial3DView::new("3D Space View")
-            .with_origin("/")
-            .with_contents(["/**"]);
-        let blueprint = Blueprint::new(view);
-        blueprint.send(&rec, BlueprintActivation::default())?;
+        let rec = rec.serve(
+            "0.0.0.0",
+            Default::default(),
+            Default::default(),
+            rerun::MemoryLimit::UNLIMITED,
+            false,
+        )?;
 
         // Set default bounds to (-16, 16) centered at origin (0,0,0)
         let default_bounds = Boxes3D::from_centers_and_half_sizes([(0.0, 0.0, 0.0)], [(16.0, 16.0, 16.0)]);
