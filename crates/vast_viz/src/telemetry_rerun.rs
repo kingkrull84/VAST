@@ -1,6 +1,6 @@
 use vast_core::lattice::octree::Octree;
 use rerun::blueprint::{Blueprint, BlueprintActivation, Spatial3DView};
-use rerun::{Boxes3D, Color, FillMode, Points3D, RecordingStream, RecordingStreamBuilder};
+use rerun::{Boxes3D, Color, Points3D, RecordingStream, RecordingStreamBuilder};
 
 pub struct TelemetryRerun {
     rec: RecordingStream,
@@ -8,7 +8,8 @@ pub struct TelemetryRerun {
 
 impl TelemetryRerun {
     pub fn new(app_name: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let rec = RecordingStreamBuilder::new(app_name).spawn()?;
+        let rec = RecordingStreamBuilder::new(app_name);
+        let rec = rec.spawn()?;
 
         let view = Spatial3DView::new("3D Space View")
             .with_origin("/")
@@ -17,9 +18,8 @@ impl TelemetryRerun {
         blueprint.send(&rec, BlueprintActivation::default())?;
 
         // Set default bounds to (-16, 16) centered at origin (0,0,0)
-        let default_bounds = Boxes3D::from_centers_and_half_sizes([(0.0, 0.0, 0.0)], [(16.0, 16.0, 16.0)])
-            .with_fill_mode(FillMode::MajorWireframe);
-        rec.log_static("world/bounds", &default_bounds)?;
+        let default_bounds = Boxes3D::from_centers_and_half_sizes([(0.0, 0.0, 0.0)], [(16.0, 16.0, 16.0)]);
+        rec.log("world/bounds", &default_bounds)?;
 
         Ok(Self { rec })
     }
@@ -64,8 +64,7 @@ impl TelemetryRerun {
         }
 
         if !box_centers.is_empty() {
-            let boxes = Boxes3D::from_centers_and_half_sizes(box_centers, box_half_sizes)
-                .with_fill_mode(FillMode::MajorWireframe);
+            let boxes = Boxes3D::from_centers_and_half_sizes(box_centers, box_half_sizes);
             self.rec.log("world/leaf_regions", &boxes)?;
         }
 

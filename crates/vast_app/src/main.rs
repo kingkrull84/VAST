@@ -14,7 +14,7 @@ fn main() {
     println!("Initialized Sparse Octree lattice bounds: {:?}", bounds);
 
     // Fill initial [-16, 16] AABB bounds with resting ID 2 couplets (Element Zero)
-    let element_zero_dna = Tpes::new(0, 0, 0, 0);
+    let element_zero_dna = Tpes::new(2, 2, 1, 1);
     for x in -16..=16 {
         for y in -16..=16 {
             for z in -16..=16 {
