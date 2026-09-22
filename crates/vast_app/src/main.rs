@@ -4,7 +4,8 @@ use vast_core::stamp::stamp_electron;
 use vast_core::tpes::Tpes;
 use vast_viz::TelemetryRerun;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     println!("=== VAST Engine Simulation Starting ===");
 
     // Define 3D bounding box for simulation space (-16..16 on all axes)
@@ -66,7 +67,6 @@ fn main() {
 
     println!("=== VAST Engine Simulation Completed Successfully ===");
 
-    println!("\n3D Viewport is running. Press Enter in this terminal to exit...");
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).ok();
+    println!("\n3D Viewport is running. Waiting for Ctrl+C to exit...");
+    let _ = tokio::signal::ctrl_c().await;
 }
