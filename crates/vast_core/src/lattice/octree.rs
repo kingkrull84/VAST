@@ -209,6 +209,16 @@ impl OctreeNode {
 
     /// Static helper to collapse a node at a given index in the arena pool.
     pub fn collapse_at(pool: &mut Vec<OctreeNode>, node_idx: usize) -> bool {
+        Self::collapse_at_with_depth(pool, node_idx, 0, 8)
+    }
+
+    /// Helper to collapse a node while preserving Geometric Gravity resolution depths.
+    pub fn collapse_at_with_depth(
+        pool: &mut Vec<OctreeNode>,
+        node_idx: usize,
+        current_depth: usize,
+        max_depth: usize,
+    ) -> bool {
         let children_indices = match pool.get(node_idx) {
             Some(OctreeNode::Branch { children_indices }) => *children_indices,
             _ => return false,
@@ -220,9 +230,16 @@ impl OctreeNode {
             }
             match &pool[child_idx] {
                 OctreeNode::Leaf { couplets } => {
-                    for (_, couplet) in couplets {
+                    for (pos, couplet) in couplets {
                         if couplet.total_flux().value() != 0 {
                             return false;
+                        }
+                        if couplet.id == 2 {
+                            let dist = pos.0.abs().max(pos.1.abs()).max(pos.2.abs());
+                            let target_depth = (9 - dist).clamp(1, max_depth as i64) as usize;
+                            if current_depth < target_depth {
+                                return false;
+                            }
                         }
                     }
                 }
@@ -424,6 +441,50 @@ impl Octree {
         }
     }
 
+    pub fn delete(&mut self, pos: (i64, i64, i64)) -> bool {
+        if !self.bounds.contains(pos) {
+            return false;
+        }
+        let deleted = Self::delete_from_pool(&mut self.read_state, 0, self.bounds, pos);
+        if deleted {
+            self.write_state = self.read_state.clone();
+        }
+        deleted
+    }
+
+    fn delete_from_pool(
+        pool: &mut Vec<OctreeNode>,
+        node_idx: usize,
+        bounds: AABB,
+        pos: (i64, i64, i64),
+    ) -> bool {
+        if !bounds.contains(pos) || node_idx >= pool.len() {
+            return false;
+        }
+
+        match &mut pool[node_idx] {
+            OctreeNode::Leaf { couplets } => {
+                if let Some(idx) = couplets.iter().position(|(p, _)| *p == pos) {
+                    couplets.swap_remove(idx);
+                    true
+                } else {
+                    false
+                }
+            }
+            OctreeNode::Branch { children_indices } => {
+                let children_indices = *children_indices;
+                let mid_x = bounds.min_x + (bounds.max_x - bounds.min_x) / 2;
+                let mid_y = bounds.min_y + (bounds.max_y - bounds.min_y) / 2;
+                let mid_z = bounds.min_z + (bounds.max_z - bounds.min_z) / 2;
+
+                let child_slot = Self::get_child_index(pos, mid_x, mid_y, mid_z);
+                let child_idx = children_indices[child_slot];
+                let child_bounds = Self::get_child_bounds(bounds, child_slot, mid_x, mid_y, mid_z);
+                Self::delete_from_pool(pool, child_idx, child_bounds, pos)
+            }
+        }
+    }
+
     /// Collects all active couplets into a hash map from the read pool.
     fn collect_couplets_from_pool(pool: &[OctreeNode], node_idx: usize, map: &mut HashMap<(i64, i64, i64), Couplet>) {
         if node_idx >= pool.len() {
@@ -450,10 +511,73 @@ impl Octree {
         let mut read_map = HashMap::new();
         Self::collect_couplets_from_pool(&self.read_state, 0, &mut read_map);
 
-        // Ensure write_state matches topology of read_state
-        if self.write_state.len() != self.read_state.len() {
-            self.write_state = self.read_state.clone();
+        // Pre-step: Identity Routing & Monopole Drain (Distance 1 unbinding)
+        let mut consumed_positions = Vec::new();
+        let mut recycled_boundary_positions = Vec::new();
+        let mut id1_absorptions: HashMap<(i64, i64, i64), (u32, [u32; 27])> = HashMap::new();
+
+        for (&id1_pos, id1_couplet) in &read_map {
+            if id1_couplet.id == 1 || id1_couplet.particle_dna.net_charge() < 0 {
+                for k in 0..27 {
+                    if k == 13 {
+                        continue;
+                    }
+                    let dir = DIRECTION_VECTORS[k];
+                    let neighbor_pos = (id1_pos.0 + dir.0, id1_pos.1 + dir.1, id1_pos.2 + dir.2);
+                    if let Some(neighbor) = read_map.get(&neighbor_pos) {
+                        if neighbor.id == 2 {
+                            consumed_positions.push(neighbor_pos);
+
+                            let bx = if dir.0 > 0 { self.bounds.max_x } else if dir.0 < 0 { self.bounds.min_x } else { 0 };
+                            let by = if dir.1 > 0 { self.bounds.max_y } else if dir.1 < 0 { self.bounds.min_y } else { 0 };
+                            let bz = if dir.2 > 0 { self.bounds.max_z } else if dir.2 < 0 { self.bounds.min_z } else { 0 };
+                            let boundary_pos = if bx != 0 || by != 0 || bz != 0 {
+                                (bx, by, bz)
+                            } else {
+                                (self.bounds.max_x, 0, 0)
+                            };
+                            recycled_boundary_positions.push(boundary_pos);
+
+                            let entry = id1_absorptions.entry(id1_pos).or_insert((0, [0; 27]));
+                            entry.0 += 1;
+                            let b_indices = [22, 4, 16, 10]; // +X, -X, +Y, -Y
+                            for &idx in &b_indices {
+                                entry.1[idx] += 1;
+                            }
+                        }
+                    }
+                }
+            }
         }
+
+        // Delete consumed ID 2 couplets from the octree
+        for pos in &consumed_positions {
+            Self::delete_from_pool(&mut self.read_state, 0, self.bounds, *pos);
+            read_map.remove(pos);
+        }
+
+        // Toroidal Boundary Recycling: inject new ID 2 couplets at outer boundary shell
+        let element_zero_dna = crate::tpes::Tpes::new(0, 0, 0, 0);
+        for boundary_pos in recycled_boundary_positions {
+            let cap = self.capacity;
+            let max_d = self.max_depth;
+            let bounds = self.bounds;
+            let couplet = Couplet::new_baseline(element_zero_dna);
+            Self::insert_into_pool(&mut self.read_state, 0, bounds, boundary_pos, couplet, cap, max_d, 0);
+        }
+
+        // Apply energy absorption & tangential flux ejections to ID 1 nodes in read_map
+        for (id1_pos, (add_energy, ejections)) in &id1_absorptions {
+            if let Some(c) = read_map.get_mut(id1_pos) {
+                c.energy += Z9::new(*add_energy as i32);
+                for k in 0..27 {
+                    c.flux[k] += Z9::new(ejections[k] as i32);
+                }
+            }
+        }
+
+        // Synchronize write_state with read_state following deletions and insertions
+        self.write_state = self.read_state.clone();
 
         self.read_state
             .par_iter()
@@ -473,6 +597,15 @@ impl Octree {
                             let source_pos = (pos.0 - dir.0, pos.1 - dir.1, pos.2 - dir.2);
                             if let Some(source_couplet) = read_map.get(&source_pos) {
                                 advected_flux[k] = source_couplet.flux[k];
+                            }
+                        }
+
+                        // Include tangential momentum ejections from pre-step monopole drain unbinding
+                        if let Some((_, ejections)) = id1_absorptions.get(pos) {
+                            for k in 0..27 {
+                                if ejections[k] > 0 {
+                                    advected_flux[k] += Z9::new(ejections[k] as i32);
+                                }
                             }
                         }
 
@@ -518,6 +651,11 @@ impl Octree {
 
                         write_couplets[i].1.flux = advected_flux;
                         write_couplets[i].1.pressure = read_couplet.pressure + Z9::ONE;
+                        if let Some(updated_couplet) = read_map.get(pos) {
+                            write_couplets[i].1.energy = updated_couplet.energy;
+                        } else {
+                            write_couplets[i].1.energy = read_couplet.energy;
+                        }
                     }
                 }
             });
@@ -557,12 +695,28 @@ impl Octree {
             let mut couplets_to_redistribute = Vec::new();
 
             if let OctreeNode::Leaf { couplets } = &pool[node_idx] {
-                if couplets.len() > 1 && current_depth < max_depth {
-                    let max_flux = couplets.iter().map(|(_, c)| c.total_flux().value()).max().unwrap_or(0);
-                    let min_flux = couplets.iter().map(|(_, c)| c.total_flux().value()).min().unwrap_or(0);
-                    let gradient = max_flux.saturating_sub(min_flux);
-                    if gradient > threshold {
-                        should_subdivide = true;
+                if current_depth < max_depth {
+                    for (pos, couplet) in couplets {
+                        if couplet.id == 2 {
+                            let dist = pos.0.abs().max(pos.1.abs()).max(pos.2.abs());
+                            let target_depth = (9 - dist).clamp(1, max_depth as i64) as usize;
+                            if current_depth < target_depth {
+                                should_subdivide = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if !should_subdivide && couplets.len() > 1 {
+                        let max_flux = couplets.iter().map(|(_, c)| c.total_flux().value()).max().unwrap_or(0);
+                        let min_flux = couplets.iter().map(|(_, c)| c.total_flux().value()).min().unwrap_or(0);
+                        let gradient = max_flux.saturating_sub(min_flux);
+                        if gradient > threshold {
+                            should_subdivide = true;
+                        }
+                    }
+
+                    if should_subdivide {
                         couplets_to_redistribute = couplets.clone();
                     }
                 }
@@ -619,7 +773,7 @@ impl Octree {
                 );
             }
 
-            OctreeNode::collapse_at(pool, node_idx);
+            OctreeNode::collapse_at_with_depth(pool, node_idx, current_depth, max_depth);
         }
     }
 
@@ -928,5 +1082,58 @@ mod tests {
         let t = octree.telemetry();
         assert_eq!(t.total_couplets, 2);
         assert!(t.max_depth > 0);
+    }
+
+    #[test]
+    fn test_monopole_drain_and_unbinding() {
+        use crate::stamp::stamp_electron;
+
+        let bounds = AABB::new(-16, 16, -16, 16, -16, 16);
+        let mut octree = Octree::new(bounds, 4, 8);
+
+        // Stamp Electron (ID 1) at (0, 0, 0)
+        stamp_electron(&mut octree, (0, 0, 0));
+
+        // Insert ID 2 Space couplet adjacent at (1, 0, 0)
+        let element_zero_dna = Tpes::new(0, 0, 0, 0);
+        octree.insert((1, 0, 0), Couplet::new_baseline(element_zero_dna));
+
+        assert_eq!(octree.telemetry().total_couplets, 2);
+
+        // Step simulation: Monopole Drain unbinds ID 2 at (1, 0, 0)
+        octree.step(2);
+
+        // ID 2 node at (1, 0, 0) must be deleted from lattice
+        assert!(octree.query((1, 0, 0)).is_none());
+
+        // ID 1 Electron at (0, 0, 0) absorbed energy and ejected flux tangentially
+        let id1 = octree.query((0, 0, 0)).expect("Electron at (0,0,0) should exist");
+        assert!(id1.energy > Z9::new(1)); // Energy increased from initial 1
+        let equatorial_flux = id1.flux[22] + id1.flux[4] + id1.flux[16] + id1.flux[10];
+        assert!(equatorial_flux > Z9::ZERO); // Ejected tangentially along equator
+
+        // Toroidal boundary recycling injected a new ID 2 node on outer boundary at (16, 0, 0)
+        assert!(octree.query((16, 0, 0)).is_some());
+        assert_eq!(octree.telemetry().total_couplets, 2); // Constant total volume
+    }
+
+    #[test]
+    fn test_geometric_gravity_subdivision() {
+        use crate::stamp::stamp_electron;
+
+        let bounds = AABB::new(-16, 16, -16, 16, -16, 16);
+        let mut octree = Octree::new(bounds, 4, 8);
+
+        stamp_electron(&mut octree, (0, 0, 0));
+
+        let element_zero_dna = Tpes::new(0, 0, 0, 0);
+        // Insert ID 2 node at dist = 2 (close to drain)
+        octree.insert((2, 0, 0), Couplet::new_baseline(element_zero_dna));
+
+        octree.step(2);
+
+        let t = octree.telemetry();
+        // Close to drain (dist = 2), target_depth = 9 - 2 = 7
+        assert!(t.max_depth >= 7);
     }
 }
