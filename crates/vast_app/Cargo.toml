@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 vast_core = { path = "../vast_core" }
 vast_viz = { path = "../vast_viz" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
